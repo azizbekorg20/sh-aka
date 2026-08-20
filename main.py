@@ -19,14 +19,10 @@ from aiogram.types import (
 # SOZLAMALAR
 # =========================================================
 
-TOKEN = "8866415165:AAEPrFMsv0KqjauBZiq3ZY-refC564JQC80"
+TOKEN = "BOT_TOKENINGIZNI_BU_YERGA_YOZING"
 
 # O'Z TELEGRAM IDINGIZNI YOZING
-ADMIN_ID = 7822595706
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+ADMIN_ID = 123456789
 
 
 # =========================================================
@@ -42,42 +38,77 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT,
     username TEXT,
     phone TEXT,
-    status TEXT DEFAULT 'pending'
+    status TEXT DEFAULT 'pending',
+    workspace_id INTEGER
 )
 """)
 
-# Stollar endi UMUMIY (hech qanday user_id yo'q — hammaga bitta ro'yxat)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS tables (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    table_number INTEGER NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL,
+    table_number INTEGER NOT NULL,
     price_per_hour REAL NOT NULL,
     is_active INTEGER DEFAULT 0,
-    start_time TEXT,
-    started_by INTEGER
+    start_time TEXT
 )
 """)
 
-# Qo'shimchalar ham UMUMIY
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS extras (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     price REAL NOT NULL
 )
 """)
 
-# Faol (hozirgi hisobdagi) qo'shimchalar — stolga bog'liq, userga emas
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS active_extras (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
     table_id INTEGER NOT NULL,
     extra_id INTEGER NOT NULL,
     quantity INTEGER NOT NULL
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    table_number INTEGER NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    duration_seconds INTEGER NOT NULL,
+    table_money REAL NOT NULL,
+    extras_money REAL NOT NULL,
+    total_money REAL NOT NULL
+)
+""")
+
+# Eski bot bazasida workspace_id bo'lmasa qo'shamiz.
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN workspace_id INTEGER")
+except sqlite3.OperationalError:
+    pass
+
+cursor.execute("UPDATE users SET workspace_id=user_id WHERE workspace_id IS NULL")
 db.commit()
+
+# Bog'langan foydalanuvchilar uchun tezkor workspace cache.
+workspace_cache = {}
+cursor.execute("SELECT user_id, COALESCE(workspace_id, user_id) FROM users")
+for _uid, _workspace in cursor.fetchall():
+    workspace_cache[_uid] = _workspace
+
+def workspace_id(user_id):
+    return workspace_cache.get(user_id, user_id)
+
+
+# SQL ichidan workspace_id(user_id) ni chaqirish uchun.
+db.create_function("workspace", 1, workspace_id)
+
 
 
 # =========================================================
@@ -91,41 +122,17 @@ user_state = {}
 
 
 # =========================================================
-# ASOSIY MENYULAR
+# ASOSIY MENU
 # =========================================================
 
-def main_keyboard(user_id: int):
-    """
-    Admin — to'liq menyu (stol/qo'shimcha qo'shish-ayirish huquqi bilan).
-    Oddiy foydalanuvchi — faqat ishlatish uchun menyu.
-    """
-
-    if is_admin(user_id):
-
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [
-                    KeyboardButton(text="🪑 Stol qo‘shish"),
-                    KeyboardButton(text="➖ Stol ayirish")
-                ],
-                [
-                    KeyboardButton(text="🪑 Stollar"),
-                    KeyboardButton(text="▶️ Vaqtni boshlash")
-                ],
-                [
-                    KeyboardButton(text="⏹ Vaqtni to‘xtatish"),
-                    KeyboardButton(text="📊 Hisobot")
-                ],
-                [
-                    KeyboardButton(text="🥤 Qo‘shimcha qo‘shish"),
-                    KeyboardButton(text="📦 Qo‘shimchalar")
-                ]
-            ],
-            resize_keyboard=True
-        )
+def main_keyboard():
 
     return ReplyKeyboardMarkup(
         keyboard=[
+            [
+                KeyboardButton(text="🪑 Stol qo‘shish"),
+                KeyboardButton(text="➖ Stol ayirish")
+            ],
             [
                 KeyboardButton(text="🪑 Stollar"),
                 KeyboardButton(text="▶️ Vaqtni boshlash")
@@ -135,7 +142,12 @@ def main_keyboard(user_id: int):
                 KeyboardButton(text="📊 Hisobot")
             ],
             [
+                KeyboardButton(text="🥤 Qo‘shimcha qo‘shish"),
                 KeyboardButton(text="📦 Qo‘shimchalar")
+            ],
+            [
+                KeyboardButton(text="🔗 Ulanish"),
+                KeyboardButton(text="📅 Kunlik hisobot")
             ]
         ],
         resize_keyboard=True
@@ -157,8 +169,159 @@ async def back_button(message: Message):
 
     await message.answer(
         "🏠 Asosiy menyu:",
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
+
+
+# =========================================================
+# ULanish / WORKSPACE
+# =========================================================
+
+@dp.message(F.text == "🔗 Ulanish")
+async def connect_start(message: Message):
+    user_id = message.from_user.id
+    user_state[user_id] = {"action": "link_user_id"}
+    await message.answer(
+        "🔗 Ulanish\n\n"
+        "Ulanmoqchi bo‘lgan foydalanuvchining Telegram ID sini yuboring.\n\n"
+        "Masalan: 123456789\n\n"
+        "🔙 Orqaga — bekor qilish"
+    )
+
+
+@dp.message(
+    lambda m: m.from_user.id in user_state
+    and user_state[m.from_user.id].get("action") == "link_user_id"
+)
+async def connect_user_id(message: Message):
+    requester_id = message.from_user.id
+
+    try:
+        target_id = int(message.text.strip())
+    except (ValueError, AttributeError):
+        await message.answer("❌ Telegram ID faqat raqamlardan iborat bo‘ladi.")
+        return
+
+    if target_id == requester_id:
+        await message.answer("❌ O‘zingiz bilan ulana olmaysiz.")
+        return
+
+    cursor.execute("SELECT name, status, COALESCE(workspace_id, user_id) FROM users WHERE user_id=?", (target_id,))
+    target = cursor.fetchone()
+
+    if not target:
+        await message.answer("❌ Bu ID bilan foydalanuvchi topilmadi.")
+        return
+
+    target_name, target_status, target_workspace = target
+
+    if target_status != "approved":
+        await message.answer("❌ Bu foydalanuvchi hali botda tasdiqlanmagan.")
+        return
+
+    requester_workspace = workspace_id(requester_id)
+
+    if target_workspace == requester_workspace:
+        await message.answer("✅ Sizlar allaqachon ulangan ekansiz.")
+        user_state.pop(requester_id, None)
+        return
+
+    # Bir xil stol raqami bo‘lsa, birlashtirish noaniq bo‘lib qolmasligi uchun rad qilamiz.
+    cursor.execute("SELECT table_number FROM tables WHERE user_id=?", (requester_workspace,))
+    own_tables = {r[0] for r in cursor.fetchall()}
+    cursor.execute("SELECT table_number FROM tables WHERE user_id=?", (target_workspace,))
+    target_tables = {r[0] for r in cursor.fetchall()}
+    duplicates = own_tables & target_tables
+
+    if duplicates:
+        nums = ", ".join(map(str, sorted(duplicates)))
+        await message.answer(
+            f"❌ Ulanib bo‘lmaydi. Ikkalangizda ham bir xil stol raqami bor: {nums}.\n"
+            "Avval ulardan birini o‘zgartiring yoki o‘chiring."
+        )
+        return
+
+    user_state.pop(requester_id, None)
+
+    await bot.send_message(
+        target_id,
+        "🔗 ULanish so‘rovi\n\n"
+        f"👤 {message.from_user.full_name}\n"
+        f"🆔 ID: {requester_id}\n\n"
+        "Bu foydalanuvchi bilan qo‘shilasizmi?\n\n"
+        "Ulangandan keyin stollar, narxlar, qo‘shimchalar va hisobotlar umumiy bo‘ladi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ HA", callback_data=f"link_yes:{requester_id}"),
+                InlineKeyboardButton(text="❌ YO‘Q", callback_data=f"link_no:{requester_id}")
+            ]
+        ])
+    )
+
+    await message.answer("📨 So‘rov yuborildi. Ikkinchi foydalanuvchi tasdiqlashini kuting.", reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data.startswith("link_yes:"))
+async def connect_accept(callback: CallbackQuery):
+    target_id = callback.from_user.id
+    requester_id = int(callback.data.split(":")[1])
+
+    cursor.execute("SELECT COALESCE(workspace_id, user_id) FROM users WHERE user_id=?", (target_id,))
+    target_row = cursor.fetchone()
+    cursor.execute("SELECT COALESCE(workspace_id, user_id) FROM users WHERE user_id=?", (requester_id,))
+    requester_row = cursor.fetchone()
+
+    if not target_row or not requester_row:
+        await callback.answer("❌ Foydalanuvchi topilmadi.", show_alert=True)
+        return
+
+    target_workspace = target_row[0]
+    requester_workspace = requester_row[0]
+
+    if target_workspace == requester_workspace:
+        await callback.answer("Sizlar allaqachon ulangan.")
+        return
+
+    # Ikkala workspace ma'lumotlarini requester workspace'iga birlashtiramiz.
+    cursor.execute("UPDATE tables SET user_id=? WHERE user_id=?", (requester_workspace, target_workspace))
+    cursor.execute("UPDATE extras SET user_id=? WHERE user_id=?", (requester_workspace, target_workspace))
+    cursor.execute("UPDATE active_extras SET user_id=? WHERE user_id=?", (requester_workspace, target_workspace))
+    cursor.execute("UPDATE sessions SET user_id=? WHERE user_id=?", (requester_workspace, target_workspace))
+    cursor.execute("UPDATE users SET workspace_id=? WHERE user_id IN (?, ?)", (requester_workspace, requester_id, target_id))
+    db.commit()
+
+    workspace_cache[requester_id] = requester_workspace
+    workspace_cache[target_id] = requester_workspace
+
+    await callback.message.edit_text(
+        callback.message.text + "\n\n✅ ULANDI"
+    )
+
+    await bot.send_message(
+        requester_id,
+        "🎉 Ulanish tasdiqlandi!\n\n"
+        "Endi stollar, narxlar, qo‘shimchalar va hisobotlar ikkalangizda ham umumiy.",
+        reply_markup=main_keyboard()
+    )
+
+    await callback.answer("Ulanish tasdiqlandi ✅")
+
+
+@dp.callback_query(F.data.startswith("link_no:"))
+async def connect_reject(callback: CallbackQuery):
+    requester_id = int(callback.data.split(":")[1])
+    target_id = callback.from_user.id
+
+    await callback.message.edit_text(
+        callback.message.text + "\n\n❌ RAD ETILDI"
+    )
+
+    await bot.send_message(
+        requester_id,
+        "❌ Ulanish so‘rovingiz rad etildi."
+    )
+
+    await callback.answer("So‘rov rad etildi ❌")
 
 
 # =========================================================
@@ -212,43 +375,6 @@ async def start(message: Message):
 
     user_id = message.from_user.id
 
-    # Admin har doim avtomatik tasdiqlangan hisoblanadi
-    if is_admin(user_id):
-
-        cursor.execute(
-            "SELECT status FROM users WHERE user_id=?",
-            (user_id,)
-        )
-
-        if not cursor.fetchone():
-
-            cursor.execute("""
-                INSERT INTO users
-                (user_id, name, username, status)
-                VALUES (?, ?, ?, 'approved')
-            """, (
-                user_id,
-                message.from_user.full_name,
-                message.from_user.username
-            ))
-
-            db.commit()
-
-        else:
-
-            cursor.execute(
-                "UPDATE users SET status='approved' WHERE user_id=?",
-                (user_id,)
-            )
-            db.commit()
-
-        await message.answer(
-            "👑 Xush kelibsiz, Admin!\n\n"
-            "🏠 Asosiy menyu:",
-            reply_markup=main_keyboard(user_id)
-        )
-        return
-
     cursor.execute(
         "SELECT status FROM users WHERE user_id=?",
         (user_id,)
@@ -269,7 +395,7 @@ async def start(message: Message):
 
         await message.answer(
             "🏠 Asosiy menyu:",
-            reply_markup=main_keyboard(user_id)
+            reply_markup=main_keyboard()
         )
         return
 
@@ -287,15 +413,17 @@ async def start(message: Message):
 
     cursor.execute("""
         INSERT INTO users
-        (user_id, name, username, status)
-        VALUES (?, ?, ?, 'pending')
+        (user_id, name, username, status, workspace_id)
+        VALUES (?, ?, ?, 'pending', ?)
     """, (
         user_id,
         message.from_user.full_name,
-        message.from_user.username
+        message.from_user.username,
+        user_id
     ))
 
     db.commit()
+    workspace_cache[user_id] = user_id
 
     await message.answer(
         "👋 Assalomu alaykum!\n\n"
@@ -373,7 +501,7 @@ async def receive_contact(message: Message):
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_user(callback: CallbackQuery):
 
-    if not is_admin(callback.from_user.id):
+    if callback.from_user.id != ADMIN_ID:
 
         await callback.answer(
             "❌ Siz admin emassiz.",
@@ -402,7 +530,7 @@ async def approve_user(callback: CallbackQuery):
         user_id,
         "🎉 Siz tasdiqlandingiz!\n\n"
         "Endi botdan foydalanishingiz mumkin.",
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
 
     await callback.answer(
@@ -417,7 +545,7 @@ async def approve_user(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("reject:"))
 async def reject_user(callback: CallbackQuery):
 
-    if not is_admin(callback.from_user.id):
+    if callback.from_user.id != ADMIN_ID:
 
         await callback.answer(
             "❌ Siz admin emassiz.",
@@ -454,22 +582,13 @@ async def reject_user(callback: CallbackQuery):
 
 
 # =========================================================
-# STOL QO‘SHISH (FAQAT ADMIN)
+# STOL QO‘SHISH
 # =========================================================
 
 @dp.message(F.text == "🪑 Stol qo‘shish")
 async def add_table(message: Message):
 
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-
-        await message.answer(
-            "⛔ Bu funksiya faqat admin uchun."
-        )
-        return
-
-    user_state[user_id] = {
+    user_state[message.from_user.id] = {
         "action": "table_number"
     }
 
@@ -505,8 +624,11 @@ async def table_number(message: Message):
     cursor.execute("""
         SELECT id
         FROM tables
-        WHERE table_number=?
-    """, (number,))
+        WHERE user_id=workspace(?) AND table_number=?
+    """, (
+        user_id,
+        number
+    ))
 
     if cursor.fetchone():
 
@@ -553,9 +675,10 @@ async def table_price(message: Message):
 
     cursor.execute("""
         INSERT INTO tables
-        (table_number, price_per_hour)
-        VALUES (?, ?)
+        (user_id, table_number, price_per_hour)
+        VALUES (workspace(?), ?, ?)
     """, (
+        user_id,
         number,
         price
     ))
@@ -568,12 +691,12 @@ async def table_price(message: Message):
         f"✅ Stol qo‘shildi!\n\n"
         f"🪑 Stol №{number}\n"
         f"💰 1 soat: {price:.0f} so‘m",
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
 
 
 # =========================================================
-# STOLLAR (HAMMAGA UMUMIY RO‘YXAT)
+# STOLLAR
 # =========================================================
 
 @dp.message(F.text == "🪑 Stollar")
@@ -585,25 +708,25 @@ async def show_tables(message: Message):
         SELECT table_number,
                price_per_hour,
                is_active,
-               start_time,
-               started_by
+               start_time
         FROM tables
+        WHERE user_id=workspace(?)
         ORDER BY table_number
-    """)
+    """, (user_id,))
 
     tables = cursor.fetchall()
 
     if not tables:
 
         await message.answer(
-            "❌ Hozircha stol mavjud emas.",
-            reply_markup=main_keyboard(user_id)
+            "❌ Sizda hali stol mavjud emas.",
+            reply_markup=main_keyboard()
         )
         return
 
     text = "🪑 STOLLAR\n\n"
 
-    for number, price, active, start_time, started_by in tables:
+    for number, price, active, start_time in tables:
 
         if active:
 
@@ -620,20 +743,12 @@ async def show_tables(message: Message):
 
             money = seconds / 3600 * price
 
-            cursor.execute(
-                "SELECT name FROM users WHERE user_id=?",
-                (started_by,)
-            )
-            starter = cursor.fetchone()
-            starter_name = starter[0] if starter else "Noma'lum"
-
             text += (
                 f"🟢 Stol №{number}\n"
                 f"⏱ {hours} soat "
                 f"{minutes} daqiqa "
                 f"{secs} soniya\n"
-                f"💰 {money:.0f} so‘m\n"
-                f"👤 Boshlagan: {starter_name}\n\n"
+                f"💰 {money:.0f} so‘m\n\n"
             )
 
         else:
@@ -646,12 +761,12 @@ async def show_tables(message: Message):
 
     await message.answer(
         text,
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
 
 
 # =========================================================
-# VAQT BOSHLASH (HAMMA TASDIQLANGAN FOYDALANUVCHI UCHUN)
+# VAQT BOSHLASH
 # =========================================================
 
 @dp.message(F.text == "▶️ Vaqtni boshlash")
@@ -662,16 +777,16 @@ async def start_timer(message: Message):
     cursor.execute("""
         SELECT id, table_number
         FROM tables
-        WHERE is_active=0
+        WHERE user_id=workspace(?)
         ORDER BY table_number
-    """)
+    """, (user_id,))
 
     tables = cursor.fetchall()
 
     if not tables:
 
         await message.answer(
-            "❌ Hozir bo‘sh stol yo‘q."
+            "❌ Avval stol qo‘shing."
         )
         return
 
@@ -727,8 +842,12 @@ async def start_selected_table(message: Message):
                price_per_hour,
                is_active
         FROM tables
-        WHERE table_number=?
-    """, (number,))
+        WHERE user_id=workspace(?)
+        AND table_number=?
+    """, (
+        user_id,
+        number
+    ))
 
     result = cursor.fetchone()
 
@@ -753,12 +872,10 @@ async def start_selected_table(message: Message):
     cursor.execute("""
         UPDATE tables
         SET is_active=1,
-            start_time=?,
-            started_by=?
+            start_time=?
         WHERE id=?
     """, (
         now.isoformat(),
-        user_id,
         table_id
     ))
 
@@ -773,32 +890,8 @@ async def start_selected_table(message: Message):
         f"🕐 Boshlangan vaqt: "
         f"{now.strftime('%H:%M:%S')}\n\n"
         f"⏱ Hisoblash boshlandi.",
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
-
-    # Boshqa hamma tasdiqlangan foydalanuvchilarga ham xabar berish (ixtiyoriy)
-    cursor.execute(
-        "SELECT user_id, name FROM users WHERE status='approved'"
-    )
-    starter_row = cursor.execute(
-        "SELECT name FROM users WHERE user_id=?", (user_id,)
-    ).fetchone()
-    starter_name = starter_row[0] if starter_row else "Kimdir"
-
-    for other_id, _name in cursor.execute(
-        "SELECT user_id, name FROM users WHERE status='approved'"
-    ).fetchall():
-
-        if other_id == user_id:
-            continue
-
-        try:
-            await bot.send_message(
-                other_id,
-                f"ℹ️ {starter_name} Stol №{number} vaqtini boshladi."
-            )
-        except Exception:
-            pass
 
 
 # =========================================================
@@ -814,8 +907,9 @@ async def stop_timer(message: Message):
         SELECT id,
                table_number
         FROM tables
-        WHERE is_active=1
-    """)
+        WHERE user_id=workspace(?)
+        AND is_active=1
+    """, (user_id,))
 
     tables = cursor.fetchall()
 
@@ -878,9 +972,13 @@ async def stop_selected_table(message: Message):
                price_per_hour,
                start_time
         FROM tables
-        WHERE table_number=?
+        WHERE user_id=workspace(?)
+        AND table_number=?
         AND is_active=1
-    """, (number,))
+    """, (
+        user_id,
+        number
+    ))
 
     result = cursor.fetchone()
 
@@ -910,8 +1008,7 @@ async def stop_selected_table(message: Message):
     cursor.execute("""
         UPDATE tables
         SET is_active=0,
-            start_time=NULL,
-            started_by=NULL
+            start_time=NULL
         WHERE id=?
     """, (table_id,))
 
@@ -922,6 +1019,7 @@ async def stop_selected_table(message: Message):
         "table_id": table_id,
         "table_number": number,
         "table_money": table_money,
+        "start_time": start_time,
         "hours": hours,
         "minutes": minutes,
         "seconds": secs
@@ -992,19 +1090,19 @@ async def yes_extras(message: Message):
 
     user_id = message.from_user.id
 
-    cursor.execute("SELECT id FROM extras")
+    cursor.execute("""
+        SELECT id
+        FROM extras
+        WHERE user_id=workspace(?)
+    """, (user_id,))
 
     if not cursor.fetchone():
 
         await message.answer(
-            "❌ Hozircha qo‘shimcha mahsulot yo‘q."
-            + (
-                "\n\nAvval 🥤 Qo‘shimcha qo‘shish orqali "
-                "mahsulot yarating."
-                if is_admin(user_id)
-                else ""
-            ),
-            reply_markup=main_keyboard(user_id)
+            "❌ Sizda qo‘shimcha mahsulot yo‘q.\n\n"
+            "Avval 🥤 Qo‘shimcha qo‘shish orqali "
+            "mahsulot yarating.",
+            reply_markup=main_keyboard()
         )
 
         user_state.pop(user_id, None)
@@ -1015,23 +1113,24 @@ async def yes_extras(message: Message):
 
     await message.answer(
         "🥤 Qo‘shimchani tanlang:",
-        reply_markup=extras_keyboard()
+        reply_markup=extras_keyboard(user_id)
     )
 
 
 # =========================================================
-# QO‘SHIMCHA KEYBOARD (UMUMIY RO‘YXAT)
+# QO‘SHIMCHA KEYBOARD
 # =========================================================
 
-def extras_keyboard():
+def extras_keyboard(user_id):
 
     cursor.execute("""
         SELECT id,
                name,
                price
         FROM extras
+        WHERE user_id=workspace(?)
         ORDER BY id
-    """)
+    """, (user_id,))
 
     extras = cursor.fetchall()
 
@@ -1080,8 +1179,12 @@ async def choose_extra(message: Message):
             SELECT extra_id,
                    quantity
             FROM active_extras
-            WHERE table_id=?
-        """, (data["table_id"],))
+            WHERE user_id=workspace(?)
+            AND table_id=?
+        """, (
+            user_id,
+            data["table_id"]
+        ))
 
         rows = cursor.fetchall()
 
@@ -1098,8 +1201,12 @@ async def choose_extra(message: Message):
 
         cursor.execute("""
             DELETE FROM active_extras
-            WHERE table_id=?
-        """, (data["table_id"],))
+            WHERE user_id=workspace(?)
+            AND table_id=?
+        """, (
+            user_id,
+            data["table_id"]
+        ))
 
         db.commit()
 
@@ -1136,8 +1243,12 @@ async def choose_extra(message: Message):
     cursor.execute("""
         SELECT id
         FROM extras
-        WHERE name=?
-    """, (name,))
+        WHERE user_id=workspace(?)
+        AND name=?
+    """, (
+        user_id,
+        name
+    ))
 
     result = cursor.fetchone()
 
@@ -1210,9 +1321,11 @@ async def extra_quantity(message: Message):
     cursor.execute("""
         SELECT id
         FROM active_extras
-        WHERE table_id=?
+        WHERE user_id=workspace(?)
+        AND table_id=?
         AND extra_id=?
     """, (
+        user_id,
         table_id,
         extra_id
     ))
@@ -1234,9 +1347,10 @@ async def extra_quantity(message: Message):
 
         cursor.execute("""
             INSERT INTO active_extras
-            (table_id, extra_id, quantity)
-            VALUES (?, ?, ?)
+            (user_id, table_id, extra_id, quantity)
+            VALUES (workspace(?), ?, ?, ?)
         """, (
+            user_id,
             table_id,
             extra_id,
             quantity
@@ -1255,7 +1369,7 @@ async def extra_quantity(message: Message):
         "✅ Qo‘shimcha qo‘shildi!\n\n"
         "Yana qo‘shimcha tanlang yoki "
         "❌ Tugatish ni bosing.",
-        reply_markup=extras_keyboard()
+        reply_markup=extras_keyboard(user_id)
     )
 
 
@@ -1272,6 +1386,7 @@ async def finish_bill(
     user_id = message.from_user.id
 
     total = data["table_money"]
+    extras_money = 0
 
     text = (
         "🧾 YAKUNIY HISOB\n\n"
@@ -1290,7 +1405,11 @@ async def finish_bill(
                    price
             FROM extras
             WHERE id=?
-        """, (extra_id,))
+            AND user_id=?
+        """, (
+            extra_id,
+            user_id
+        ))
 
         result = cursor.fetchone()
 
@@ -1302,6 +1421,7 @@ async def finish_bill(
         money = price * quantity
 
         total += money
+        extras_money += money
 
         text += (
             f"🥤 {name} × {quantity}: "
@@ -1318,27 +1438,18 @@ async def finish_bill(
 
     await message.answer(
         text,
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
 
 
 # =========================================================
-# QO‘SHIMCHA QO‘SHISH (FAQAT ADMIN)
+# QO‘SHIMCHA QO‘SHISH
 # =========================================================
 
 @dp.message(F.text == "🥤 Qo‘shimcha qo‘shish")
 async def create_extra(message: Message):
 
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-
-        await message.answer(
-            "⛔ Bu funksiya faqat admin uchun."
-        )
-        return
-
-    user_state[user_id] = {
+    user_state[message.from_user.id] = {
         "action": "extra_name"
     }
 
@@ -1405,9 +1516,10 @@ async def extra_price(message: Message):
 
     cursor.execute("""
         INSERT INTO extras
-        (name, price)
-        VALUES (?, ?)
+        (user_id, name, price)
+        VALUES (workspace(?), ?, ?)
     """, (
+        user_id,
         name,
         price
     ))
@@ -1420,12 +1532,12 @@ async def extra_price(message: Message):
         f"✅ Qo‘shimcha yaratildi!\n\n"
         f"🥤 {name}\n"
         f"💰 {price:.0f} so‘m",
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
 
 
 # =========================================================
-# QO‘SHIMCHALAR RO‘YXATI (HAMMAGA KO‘RINADI)
+# QO‘SHIMCHALAR
 # =========================================================
 
 @dp.message(F.text == "📦 Qo‘shimchalar")
@@ -1434,10 +1546,12 @@ async def show_extras(message: Message):
     user_id = message.from_user.id
 
     cursor.execute("""
-        SELECT id, name, price
+        SELECT name,
+               price
         FROM extras
+        WHERE user_id=workspace(?)
         ORDER BY id
-    """)
+    """, (user_id,))
 
     extras = cursor.fetchall()
 
@@ -1445,155 +1559,27 @@ async def show_extras(message: Message):
 
         await message.answer(
             "❌ Qo‘shimchalar mavjud emas.",
-            reply_markup=main_keyboard(user_id)
+            reply_markup=main_keyboard()
         )
         return
 
-    buttons = []
+    text = "📦 QO‘SHIMCHALAR\n\n"
 
-    for extra_id, name, price in extras:
-        buttons.append([
-            KeyboardButton(
-                text=f"🥤 {name} — {price:.0f} so‘m"
-            )
-        ])
+    for name, price in extras:
 
-    if is_admin(user_id):
-        buttons.append([
-            KeyboardButton(text="➖ Qo‘shimcha ayirish")
-        ])
-
-    buttons.append([
-        KeyboardButton(text="🔙 Orqaga")
-    ])
+        text += (
+            f"🥤 {name} — "
+            f"{price:.0f} so‘m\n"
+        )
 
     await message.answer(
-        "📦 QO‘SHIMCHALAR",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=buttons,
-            resize_keyboard=True
-        )
+        text,
+        reply_markup=main_keyboard()
     )
 
 
 # =========================================================
-# QO‘SHIMCHA AYIRISH (FAQAT ADMIN)
-# =========================================================
-
-@dp.message(F.text == "➖ Qo‘shimcha ayirish")
-async def remove_extra(message: Message):
-
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-
-        await message.answer(
-            "⛔ Bu funksiya faqat admin uchun."
-        )
-        return
-
-    cursor.execute("""
-        SELECT id, name, price
-        FROM extras
-        ORDER BY id
-    """)
-
-    extras = cursor.fetchall()
-
-    if not extras:
-        await message.answer(
-            "❌ O‘chirish uchun qo‘shimcha yo‘q.",
-            reply_markup=main_keyboard(user_id)
-        )
-        return
-
-    buttons = []
-
-    for extra_id, name, price in extras:
-        buttons.append([
-            KeyboardButton(
-                text=f"❌ {name} — {price:.0f} so‘m"
-            )
-        ])
-
-    buttons.append([
-        KeyboardButton(text="🔙 Orqaga")
-    ])
-
-    user_state[user_id] = {
-        "action": "delete_extra"
-    }
-
-    await message.answer(
-        "➖ Qaysi qo‘shimchani o‘chirasiz?",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=buttons,
-            resize_keyboard=True
-        )
-    )
-
-
-@dp.message(
-    lambda m:
-    m.from_user.id in user_state
-    and user_state[m.from_user.id].get("action") == "delete_extra"
-)
-async def delete_extra(message: Message):
-
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-        return
-
-    if not message.text.startswith("❌ "):
-        await message.answer(
-            "❌ Qo‘shimchani tugmadan tanlang."
-        )
-        return
-
-    try:
-        product = message.text.replace("❌ ", "", 1)
-        name = product.rsplit(" — ", 1)[0]
-    except ValueError:
-        await message.answer("❌ Qo‘shimchani aniqlab bo‘lmadi.")
-        return
-
-    cursor.execute("""
-        SELECT id
-        FROM extras
-        WHERE name=?
-    """, (name,))
-
-    result = cursor.fetchone()
-
-    if not result:
-        await message.answer("❌ Qo‘shimcha topilmadi.")
-        return
-
-    extra_id = result[0]
-
-    # Shu qo‘shimcha faol hisoblarda bo‘lsa, ularni ham tozalaymiz.
-    cursor.execute("""
-        DELETE FROM active_extras
-        WHERE extra_id=?
-    """, (extra_id,))
-
-    cursor.execute("""
-        DELETE FROM extras
-        WHERE id=?
-    """, (extra_id,))
-
-    db.commit()
-    user_state.pop(user_id, None)
-
-    await message.answer(
-        f"✅ «{name}» qo‘shimchasi o‘chirildi.",
-        reply_markup=main_keyboard(user_id)
-    )
-
-
-# =========================================================
-# STOL AYIRISH (FAQAT ADMIN)
+# STOL AYIRISH
 # =========================================================
 
 @dp.message(F.text == "➖ Stol ayirish")
@@ -1601,19 +1587,13 @@ async def remove_table(message: Message):
 
     user_id = message.from_user.id
 
-    if not is_admin(user_id):
-
-        await message.answer(
-            "⛔ Bu funksiya faqat admin uchun."
-        )
-        return
-
     cursor.execute("""
         SELECT id,
                table_number
         FROM tables
+        WHERE user_id=workspace(?)
         ORDER BY table_number
-    """)
+    """, (user_id,))
 
     tables = cursor.fetchall()
 
@@ -1660,9 +1640,6 @@ async def delete_table(message: Message):
 
     user_id = message.from_user.id
 
-    if not is_admin(user_id):
-        return
-
     if not message.text.startswith("❌ Stol "):
 
         await message.answer(
@@ -1681,8 +1658,12 @@ async def delete_table(message: Message):
         SELECT id,
                is_active
         FROM tables
-        WHERE table_number=?
-    """, (number,))
+        WHERE user_id=workspace(?)
+        AND table_number=?
+    """, (
+        user_id,
+        number
+    ))
 
     result = cursor.fetchone()
 
@@ -1714,35 +1695,83 @@ async def delete_table(message: Message):
 
     await message.answer(
         f"✅ Stol №{number} o‘chirildi.",
-        reply_markup=main_keyboard(user_id)
+        reply_markup=main_keyboard()
     )
 
 
 # =========================================================
-# HISOBOT (UMUMIY, HAMMAGA)
+# KUNLIK HISOBOT
 # =========================================================
 
-@dp.message(F.text == "📊 Hisobot")
-async def report(message: Message):
+@dp.message(F.text == "📅 Kunlik hisobot")
+async def daily_report(message: Message):
 
     user_id = message.from_user.id
+    today = datetime.now().strftime("%Y-%m-%d")
+    owner = workspace_id(user_id)
 
-    cursor.execute("SELECT COUNT(*) FROM tables")
-    tables = cursor.fetchone()[0]
+    cursor.execute("""
+        SELECT COUNT(*),
+               COALESCE(SUM(duration_seconds), 0),
+               COALESCE(SUM(table_money), 0),
+               COALESCE(SUM(extras_money), 0),
+               COALESCE(SUM(total_money), 0)
+        FROM sessions
+        WHERE user_id=?
+        AND substr(end_time, 1, 10)=?
+    """, (owner, today))
 
-    cursor.execute("SELECT COUNT(*) FROM extras")
-    extras = cursor.fetchone()[0]
+    count, seconds, table_money, extras_money, total = cursor.fetchone()
 
-    cursor.execute("SELECT COUNT(*) FROM tables WHERE is_active=1")
-    active = cursor.fetchone()[0]
+    hours = int(seconds) // 3600
+    minutes = (int(seconds) % 3600) // 60
+    secs = int(seconds) % 60
 
-    await message.answer(
-        "📊 HISOBOT\n\n"
-        f"🪑 Jami stollar: {tables}\n"
-        f"🟢 Ishlayotgan stollar: {active}\n"
-        f"🥤 Qo‘shimchalar: {extras}",
-        reply_markup=main_keyboard(user_id)
+    cursor.execute("""
+        SELECT table_number,
+               COUNT(*),
+               COALESCE(SUM(duration_seconds), 0),
+               COALESCE(SUM(total_money), 0)
+        FROM sessions
+        WHERE user_id=?
+        AND substr(end_time, 1, 10)=?
+        GROUP BY table_number
+        ORDER BY table_number
+    """, (owner, today))
+
+    rows = cursor.fetchall()
+
+    text = (
+        "📅 KUNLIK HISOBOT\n\n"
+        f"🪑 Ishlatilgan stol/sessiyalar: {count} ta\n"
+        f"⏱ Jami vaqt: {hours} soat {minutes} daqiqa {secs} soniya\n"
+        f"🪑 Stol xizmatlari: {table_money:.0f} so‘m\n"
+        f"🥤 Qo‘shimchalar: {extras_money:.0f} so‘m\n"
+        f"💵 JAMI DAROMAD: {total:.0f} so‘m\n"
     )
+
+    if rows:
+        text += "\n📋 STOLLAR BO‘YICHA:\n"
+        for number, sessions_count, row_seconds, row_total in rows:
+            rh = int(row_seconds) // 3600
+            rm = (int(row_seconds) % 3600) // 60
+            rs = int(row_seconds) % 60
+            text += (
+                f"\n🪑 Stol №{number}: {sessions_count} marta\n"
+                f"⏱ {rh} soat {rm} daqiqa {rs} soniya\n"
+                f"💰 {row_total:.0f} so‘m\n"
+            )
+
+    text += "\n━━━━━━━━━━━━━━\n"
+    text += f"💰 UMUMIY: {total:.0f} so‘m"
+
+    await message.answer(text, reply_markup=main_keyboard())
+
+
+# Eski 📊 Hisobot tugmasi ham saqlanadi.
+@dp.message(F.text == "📊 Hisobot")
+async def report(message: Message):
+    await daily_report(message)
 
 
 # =========================================================
