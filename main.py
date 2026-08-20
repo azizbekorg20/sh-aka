@@ -119,6 +119,7 @@ bot = Bot(TOKEN)
 dp = Dispatcher()
 
 user_state = {}
+pending_links = {}  # requester_id -> {"target_id": int, "message_id": int}
 
 
 # =========================================================
@@ -148,6 +149,9 @@ def main_keyboard():
             [
                 KeyboardButton(text="🔗 Ulanish"),
                 KeyboardButton(text="📅 Kunlik hisobot")
+            ],
+            [
+                KeyboardButton(text="➖ Qo‘shimcha ayirish")
             ]
         ],
         resize_keyboard=True
@@ -161,12 +165,52 @@ def main_keyboard():
 
 @dp.message(F.text == "🔙 Orqaga")
 async def back_button(message: Message):
-
     user_id = message.from_user.id
+    state = user_state.get(user_id, {})
+    action = state.get("action")
 
-    # Hamma vaqtinchalik holatni o'chirish
+    # Qo'shimcha miqdori/tanlash bosqichidan bir qadam orqaga
+    if action == "extra_quantity":
+        state.pop("selected_extra", None)
+        state["action"] = "choose_extra"
+        await message.answer(
+            "🥤 Qo‘shimchani tanlang:",
+            reply_markup=extras_keyboard(user_id)
+        )
+        return
+
+    # Qo'shimcha tanlashdan "Qo'shimcha bormi?" bosqichiga qaytish
+    if action == "choose_extra":
+        state["action"] = "extras_question"
+        await message.answer(
+            "🥤 Qo‘shimcha bormi?",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="✅ Ha"), KeyboardButton(text="❌ Yo‘q")],
+                    [KeyboardButton(text="🔙 Orqaga")]
+                ],
+                resize_keyboard=True
+            )
+        )
+        return
+
+    # Stol to'xtatilganidan keyin orqaga bosilsa, hisobni qo'shimchasiz yakunlaymiz.
+    if action == "extras_question":
+        data = state.copy()
+        await finish_bill(message, data, {})
+        user_state.pop(user_id, None)
+        return
+
+    # Ulanish ID kiritish bosqichida
+    if action == "link_user_id":
+        user_state.pop(user_id, None)
+        await message.answer(
+            "❌ Ulanish bekor qilindi.",
+            reply_markup=main_keyboard()
+        )
+        return
+
     user_state.pop(user_id, None)
-
     await message.answer(
         "🏠 Asosiy menyu:",
         reply_markup=main_keyboard()
@@ -184,9 +228,38 @@ async def connect_start(message: Message):
     await message.answer(
         "🔗 Ulanish\n\n"
         "Ulanmoqchi bo‘lgan foydalanuvchining Telegram ID sini yuboring.\n\n"
-        "Masalan: 123456789\n\n"
-        "🔙 Orqaga — bekor qilish"
+        "Masalan: 123456789",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="❌ Bekor qilish",
+                        callback_data="cancel_link_input"
+                    )
+                ]
+            ]
+        )
     )
+
+
+@dp.callback_query(F.data == "cancel_link_input")
+async def cancel_link_input(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    if user_state.get(user_id, {}).get("action") != "link_user_id":
+        await callback.answer("Bu so‘rov allaqachon tugagan.", show_alert=True)
+        return
+
+    user_state.pop(user_id, None)
+
+    await callback.message.edit_text("❌ Ulanish bekor qilindi.")
+
+    await callback.message.answer(
+        "🏠 Asosiy menyu:",
+        reply_markup=main_keyboard()
+    )
+
+    await callback.answer("Bekor qilindi")
 
 
 @dp.message(
@@ -243,7 +316,7 @@ async def connect_user_id(message: Message):
 
     user_state.pop(requester_id, None)
 
-    await bot.send_message(
+    target_msg = await bot.send_message(
         target_id,
         "🔗 ULanish so‘rovi\n\n"
         f"👤 {message.from_user.full_name}\n"
@@ -258,13 +331,61 @@ async def connect_user_id(message: Message):
         ])
     )
 
-    await message.answer("📨 So‘rov yuborildi. Ikkinchi foydalanuvchi tasdiqlashini kuting.", reply_markup=main_keyboard())
+    pending_links[requester_id] = {
+        "target_id": target_id,
+        "message_id": target_msg.message_id
+    }
 
+    await message.answer(
+        "📨 So‘rov yuborildi. Ikkinchi foydalanuvchi tasdiqlashini kuting.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ So‘rovni bekor qilish",
+                callback_data="cancel_link_request"
+            )]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "cancel_link_request")
+async def cancel_link_request(callback: CallbackQuery):
+    requester_id = callback.from_user.id
+    request = pending_links.pop(requester_id, None)
+
+    if not request:
+        await callback.answer("Bu so‘rov allaqachon tugagan.", show_alert=True)
+        return
+
+    target_id = request["target_id"]
+    message_id = request["message_id"]
+
+    try:
+        await bot.edit_message_text(
+            chat_id=target_id,
+            message_id=message_id,
+            text="❌ Ulanish so‘rovi bekor qilindi."
+        )
+    except Exception:
+        pass
+
+    await callback.message.edit_text("❌ Ulanish so‘rovi bekor qilindi.")
+    await callback.message.answer(
+        "🏠 Asosiy menyu:",
+        reply_markup=main_keyboard()
+    )
+    await callback.answer("Bekor qilindi")
 
 @dp.callback_query(F.data.startswith("link_yes:"))
 async def connect_accept(callback: CallbackQuery):
     target_id = callback.from_user.id
     requester_id = int(callback.data.split(":")[1])
+
+    request = pending_links.get(requester_id)
+    if not request or request.get("target_id") != target_id:
+        await callback.answer("❌ Bu ulanish so‘rovi endi faol emas.", show_alert=True)
+        return
+
+    pending_links.pop(requester_id, None)
 
     cursor.execute("SELECT COALESCE(workspace_id, user_id) FROM users WHERE user_id=?", (target_id,))
     target_row = cursor.fetchone()
@@ -287,11 +408,23 @@ async def connect_accept(callback: CallbackQuery):
     cursor.execute("UPDATE extras SET user_id=? WHERE user_id=?", (requester_workspace, target_workspace))
     cursor.execute("UPDATE active_extras SET user_id=? WHERE user_id=?", (requester_workspace, target_workspace))
     cursor.execute("UPDATE sessions SET user_id=? WHERE user_id=?", (requester_workspace, target_workspace))
-    cursor.execute("UPDATE users SET workspace_id=? WHERE user_id IN (?, ?)", (requester_workspace, requester_id, target_id))
+
+    # Target workspace'dagi barcha foydalanuvchilarni yangi umumiy workspace'ga o'tkazamiz.
+    cursor.execute(
+        "UPDATE users SET workspace_id=? WHERE COALESCE(workspace_id, user_id)=?",
+        (requester_workspace, target_workspace)
+    )
+    cursor.execute(
+        "UPDATE users SET workspace_id=? WHERE COALESCE(workspace_id, user_id)=?",
+        (requester_workspace, requester_workspace)
+    )
     db.commit()
 
-    workspace_cache[requester_id] = requester_workspace
-    workspace_cache[target_id] = requester_workspace
+    # Cache'ni to'liq yangilaymiz — uchinchi ulangan foydalanuvchilar ham yo'qolmaydi.
+    workspace_cache.clear()
+    cursor.execute("SELECT user_id, COALESCE(workspace_id, user_id) FROM users")
+    for _uid, _workspace in cursor.fetchall():
+        workspace_cache[_uid] = _workspace
 
     await callback.message.edit_text(
         callback.message.text + "\n\n✅ ULANDI"
@@ -311,6 +444,13 @@ async def connect_accept(callback: CallbackQuery):
 async def connect_reject(callback: CallbackQuery):
     requester_id = int(callback.data.split(":")[1])
     target_id = callback.from_user.id
+
+    request = pending_links.get(requester_id)
+    if not request or request.get("target_id") != target_id:
+        await callback.answer("❌ Bu ulanish so‘rovi endi faol emas.", show_alert=True)
+        return
+
+    pending_links.pop(requester_id, None)
 
     await callback.message.edit_text(
         callback.message.text + "\n\n❌ RAD ETILDI"
@@ -1405,7 +1545,7 @@ async def finish_bill(
                    price
             FROM extras
             WHERE id=?
-            AND user_id=?
+            AND user_id=workspace(?)
         """, (
             extra_id,
             user_id
@@ -1435,6 +1575,39 @@ async def finish_bill(
         "━━━━━━━━━━━━━━\n\n"
         "✅ Stol bo‘shatildi."
     )
+
+    owner = workspace_id(user_id)
+    start_time = data["start_time"]
+    end_time = datetime.now().isoformat()
+    duration_seconds = (
+        data["hours"] * 3600
+        + data["minutes"] * 60
+        + data["seconds"]
+    )
+
+    cursor.execute("""
+        INSERT INTO sessions
+        (user_id, table_number, start_time, end_time,
+         duration_seconds, table_money, extras_money, total_money)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        owner,
+        data["table_number"],
+        start_time,
+        end_time,
+        duration_seconds,
+        data["table_money"],
+        extras_money,
+        total
+    ))
+
+    cursor.execute("""
+        DELETE FROM active_extras
+        WHERE user_id=?
+        AND table_id=?
+    """, (owner, data["table_id"]))
+
+    db.commit()
 
     await message.answer(
         text,
@@ -1579,8 +1752,101 @@ async def show_extras(message: Message):
 
 
 # =========================================================
+# QO‘SHIMCHA AYIRISH
+# =========================================================
+
+@dp.message(F.text == "➖ Qo‘shimcha ayirish")
+async def remove_extra(message: Message):
+    user_id = message.from_user.id
+
+    cursor.execute("""
+        SELECT id, name, price
+        FROM extras
+        WHERE user_id=workspace(?)
+        ORDER BY id
+    """, (user_id,))
+    extras = cursor.fetchall()
+
+    if not extras:
+        await message.answer(
+            "❌ O‘chirish uchun qo‘shimcha yo‘q.",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    buttons = []
+    for extra_id, name, price in extras:
+        buttons.append([
+            KeyboardButton(text=f"❌ Qo‘shimcha {extra_id}: {name} — {price:.0f} so‘m")
+        ])
+    buttons.append([KeyboardButton(text="🔙 Orqaga")])
+
+    user_state[user_id] = {"action": "delete_extra"}
+
+    await message.answer(
+        "➖ Qaysi qo‘shimchani o‘chirasiz?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=buttons,
+            resize_keyboard=True
+        )
+    )
+
+
+@dp.message(
+    lambda m:
+    m.from_user.id in user_state
+    and user_state[m.from_user.id].get("action") == "delete_extra"
+)
+async def delete_extra(message: Message):
+    user_id = message.from_user.id
+
+    if not message.text.startswith("❌ Qo‘shimcha "):
+        await message.answer("❌ Qo‘shimchani tugmadan tanlang.")
+        return
+
+    try:
+        extra_id = int(message.text.split(":", 1)[0].replace("❌ Qo‘shimcha ", ""))
+    except (ValueError, IndexError):
+        await message.answer("❌ Qo‘shimchani aniqlab bo‘lmadi.")
+        return
+
+    owner = workspace_id(user_id)
+
+    cursor.execute(
+        "SELECT name FROM extras WHERE id=? AND user_id=?",
+        (extra_id, owner)
+    )
+    result = cursor.fetchone()
+
+    if not result:
+        await message.answer("❌ Qo‘shimcha topilmadi.")
+        return
+
+    name = result[0]
+
+    # Kelajakdagi vaqtinchalik buyurtmalardan ham olib tashlaymiz.
+    cursor.execute(
+        "DELETE FROM active_extras WHERE extra_id=? AND user_id=?",
+        (extra_id, owner)
+    )
+    cursor.execute(
+        "DELETE FROM extras WHERE id=? AND user_id=?",
+        (extra_id, owner)
+    )
+    db.commit()
+
+    user_state.pop(user_id, None)
+
+    await message.answer(
+        f"✅ «{name}» qo‘shimchasi o‘chirildi.",
+        reply_markup=main_keyboard()
+    )
+
+
+# =========================================================
 # STOL AYIRISH
 # =========================================================
+
 
 @dp.message(F.text == "➖ Stol ayirish")
 async def remove_table(message: Message):
