@@ -19,10 +19,10 @@ from aiogram.types import (
 # SOZLAMALAR
 # =========================================================
 
-TOKEN = "BOT_TOKENINGIZNI_BU_YERGA_YOZING"
+TOKEN = "8866415165:AAEPrFMsv0KqjauBZiq3ZY-refC564JQC80"
 
 # O'Z TELEGRAM IDINGIZNI YOZING
-ADMIN_ID = 123456789
+ADMIN_ID = 8437797764
 
 
 # =========================================================
