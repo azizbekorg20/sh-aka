@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -23,6 +24,21 @@ TOKEN = "8866415165:AAEPrFMsv0KqjauBZiq3ZY-refC564JQC80"
 
 # O'Z TELEGRAM IDINGIZNI YOZING
 ADMIN_ID = 8437797764
+
+# O‘zbekiston vaqti (Sirdaryo ham shu vaqt zonasida)
+UZ_TZ = ZoneInfo("Asia/Tashkent")
+
+def now_uz():
+    """Server qayerda bo‘lishidan qat’i nazar O‘zbekiston vaqtini qaytaradi."""
+    return datetime.now(UZ_TZ)
+
+def parse_uz_time(value: str):
+    """Bazadagi eski timezone-siz vaqtlarni ham to‘g‘ri talqin qiladi."""
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UZ_TZ)
+    return dt.astimezone(UZ_TZ)
+
 
 
 # =========================================================
@@ -870,8 +886,8 @@ async def show_tables(message: Message):
 
         if active:
 
-            start = datetime.fromisoformat(start_time)
-            now = datetime.now()
+            start = parse_uz_time(start_time)
+            now = now_uz()
 
             seconds = int(
                 (now - start).total_seconds()
@@ -1007,7 +1023,7 @@ async def start_selected_table(message: Message):
         )
         return
 
-    now = datetime.now()
+    now = now_uz()
 
     cursor.execute("""
         UPDATE tables
@@ -1131,8 +1147,8 @@ async def stop_selected_table(message: Message):
 
     table_id, price, start_time = result
 
-    start = datetime.fromisoformat(start_time)
-    now = datetime.now()
+    start = parse_uz_time(start_time)
+    now = now_uz()
 
     seconds = max(
         0,
@@ -1168,6 +1184,8 @@ async def stop_selected_table(message: Message):
     await message.answer(
         f"⏹ VAQT TO‘XTATILDI!\n\n"
         f"🪑 Stol №{number}\n"
+        f"🕐 Boshlangan vaqt: {start.strftime('%d.%m.%Y %H:%M:%S')}\n"
+        f"🕐 To‘xtatilgan vaqt: {now.strftime('%d.%m.%Y %H:%M:%S')}\n"
         f"⏱ {hours} soat "
         f"{minutes} daqiqa "
         f"{secs} soniya\n"
@@ -1578,7 +1596,7 @@ async def finish_bill(
 
     owner = workspace_id(user_id)
     start_time = data["start_time"]
-    end_time = datetime.now().isoformat()
+    end_time = now_uz().isoformat()
     duration_seconds = (
         data["hours"] * 3600
         + data["minutes"] * 60
@@ -1973,7 +1991,7 @@ async def delete_table(message: Message):
 async def daily_report(message: Message):
 
     user_id = message.from_user.id
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_uz().strftime("%Y-%m-%d")
     owner = workspace_id(user_id)
 
     cursor.execute("""
